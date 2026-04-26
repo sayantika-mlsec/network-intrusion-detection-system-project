@@ -1,5 +1,6 @@
 import os
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import pandas as pd
@@ -18,15 +19,32 @@ MODEL_PATH = os.getenv("MODEL_PATH", "nids_pipeline.pkl")
 ENCODER_PATH = os.getenv("ENCODER_PATH", "nids_label_encoder.pkl")
 
 # --- LOAD ML ARTIFACTS ---
-try:
-    best_pipeline = joblib.load(MODEL_PATH)
-    label_encoder = joblib.load(ENCODER_PATH)
+# Dynamic environment variables
+MODEL_PATH = os.getenv("MODEL_PATH", "nids_pipeline.pkl")
+ENCODER_PATH = os.getenv("ENCODER_PATH", "nids_label_encoder.pkl")
+
+# Global dictionary
+ml_models = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Booting up ML Engine...")
+    try:
+        pipeline = joblib.load(MODEL_PATH)
+        ml_models["model"] = pipeline.named_steps['classifier']
+        ml_models["preprocessor"] = pipeline.named_steps['preprocessing']
+        ml_models["label_encoder"] = joblib.load(ENCODER_PATH)
+        ml_models["explainer"] = shap.TreeExplainer(ml_models["model"])
+        logger.info("ML Engine loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load ML artifacts from {MODEL_PATH}: {e}")
+        
+    yield 
     
-    model = best_pipeline.named_steps['classifier']
-    explainer = shap.TreeExplainer(model)
-    logger.info("ML Engine loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load models from {MODEL_PATH}: {e}")
+    logger.info("Shutting down ML Engine. Clearing memory...")
+    ml_models.clear()
+
+app = FastAPI(title="NIDS Threat Detection API", lifespan=lifespan)
 
 # --- SOC TRANSLATION DICTIONARY ---
 SOC_TRANSLATIONS = {
@@ -177,7 +195,9 @@ def get_top_3_shap_features(shap_explanation):
 @app.get("/health")
 def health_check():
     """AWS/GCP Load Balancer ping endpoint."""
-    return {"status": "healthy", "model_loaded": "best_pipeline" in globals()}
+    # Check if our lifespan dictionary contains the loaded pipeline!
+    is_ready = "pipeline" in ml_models 
+    return {"status": "healthy", "model_loaded": is_ready}
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_threat(packet: NetworkPacket):
@@ -185,8 +205,8 @@ def predict_threat(packet: NetworkPacket):
         # Dump using the aliases expected by the ML pipeline
         input_data = pd.DataFrame([packet.model_dump(by_alias=True)]) 
         
-        preprocessor = best_pipeline.named_steps['preprocessing']
-        model = best_pipeline.named_steps['classifier']
+        preprocessor = ml_models["preprocessor"].named_steps['preprocessing']
+        model = ml_models["model"].named_steps['classifier']
         
         transformed_data = preprocessor.transform(input_data)
         
@@ -194,7 +214,7 @@ def predict_threat(packet: NetworkPacket):
         probabilities = model.predict_proba(transformed_data)[0]
         confidence_float = float(probabilities[target_class_idx])
         
-        prediction_string = str(label_encoder.inverse_transform([target_class_idx])[0])
+        prediction_string = str(ml_models["label_encoder"].inverse_transform([target_class_idx])[0])
 
         if prediction_string == "BENIGN":
             return {
@@ -206,7 +226,7 @@ def predict_threat(packet: NetworkPacket):
         else:
             logger.info(f"Threat detected! Classification: {prediction_string} | Confidence: {confidence_float:.2f}")
             
-            shap_explanation = explainer(transformed_data)[0, :, target_class_idx]
+            shap_explanation = ml_models["explainer"](transformed_data)[0, :, target_class_idx]
             shap_explanation.feature_names = input_data.columns.tolist()
             top_3_reasons = get_top_3_shap_features(shap_explanation)
             

@@ -183,3 +183,4 @@ data/
 myenv/
 *.pkl
 *.joblib
+*.csv
