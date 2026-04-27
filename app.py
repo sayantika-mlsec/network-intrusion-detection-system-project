@@ -1,6 +1,7 @@
 import os
 import logging
 from contextlib import asynccontextmanager
+from fastapi.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import pandas as pd
@@ -12,16 +13,10 @@ import shap
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="NIDS Threat Detection API")
-
 # --- DYNAMIC CONFIGURATION ---
 MODEL_PATH = os.getenv("MODEL_PATH", "nids_pipeline.pkl")
 ENCODER_PATH = os.getenv("ENCODER_PATH", "nids_label_encoder.pkl")
 
-# --- LOAD ML ARTIFACTS ---
-# Dynamic environment variables
-MODEL_PATH = os.getenv("MODEL_PATH", "nids_pipeline.pkl")
-ENCODER_PATH = os.getenv("ENCODER_PATH", "nids_label_encoder.pkl")
 
 # Global dictionary
 ml_models = {}
@@ -36,8 +31,11 @@ async def lifespan(app: FastAPI):
         ml_models["label_encoder"] = joblib.load(ENCODER_PATH)
         ml_models["explainer"] = shap.TreeExplainer(ml_models["model"])
         logger.info("ML Engine loaded successfully.")
+    
     except Exception as e:
-        logger.error(f"Failed to load ML artifacts from {MODEL_PATH}: {e}")
+        logger.critical(f"FATAL: Failed to load ML artifacts: {e}", exc_info=True)
+        raise RuntimeError(f"ML artifact loading failed: {e}") from e
+
         
     yield 
     
@@ -161,10 +159,24 @@ class PredictionResponse(BaseModel):
     top_3_features: List[ShapFeature]  
 
 def get_top_3_shap_features(shap_explanation):
-    shap_values = shap_explanation.values
+    # Ensure it's a numpy array to easily check its shape
+    shap_values = np.array(shap_explanation.values)
+    
+    # --- DEFENSIVE PROGRAMMING GUARDRAIL ---
+    # SHAP values must be 1D (n_features,) for a single instance and single class.
+    # If it's 2D or more, np.argsort will sort row-by-row and return garbage indices.
+    if shap_values.ndim != 1:
+        raise ValueError(
+            f"SHAP Explainer Error: Expected 1D array, got shape {shap_values.shape}. "
+            "You must slice the SHAP explanation for a specific instance and target class "
+            "before passing it to this function."
+        )
+    # ----------------------------------------
+
     abs_shap_values = np.abs(shap_values)
 
     top_n = min(3, len(shap_values))
+    # Now it is perfectly safe to use np.argsort
     top_indices = np.argsort(abs_shap_values)[-top_n:][::-1]
 
     feature_names = shap_explanation.feature_names
@@ -192,52 +204,74 @@ def get_top_3_shap_features(shap_explanation):
 
 # --- ENDPOINTS ---
 
-@app.get("/health")
-def health_check():
-    """AWS/GCP Load Balancer ping endpoint."""
-    # Check if our lifespan dictionary contains the loaded pipeline!
-    is_ready = "pipeline" in ml_models 
-    return {"status": "healthy", "model_loaded": is_ready}
-
 @app.post("/predict", response_model=PredictionResponse)
-def predict_threat(packet: NetworkPacket):
+async def predict_threat(packet: NetworkPacket):  
+
+    if not ml_models.get('model'):
+        raise HTTPException(
+                status_code=503,
+                detail="Model not loaded. Service unavailable."
+    )
+    
     try:
-        # Dump using the aliases expected by the ML pipeline
+        # FAST I/O: Pydantic validation and dict dumping happen on the main event loop
         input_data = pd.DataFrame([packet.model_dump(by_alias=True)]) 
         
-        preprocessor = ml_models["preprocessor"].named_steps['preprocessing']
-        model = ml_models["model"].named_steps['classifier']
-        
-        transformed_data = preprocessor.transform(input_data)
-        
-        target_class_idx = int(model.predict(transformed_data)[0])
-        probabilities = model.predict_proba(transformed_data)[0]
-        confidence_float = float(probabilities[target_class_idx])
-        
-        prediction_string = str(ml_models["label_encoder"].inverse_transform([target_class_idx])[0])
+        # ISOLATE THE HEAVY LIFTING: Wrap the Scikit-Learn & SHAP math in a normal function
+        def compute_ml_inference():
+            preprocessor = ml_models["preprocessor"].named_steps['preprocessing']
+            model = ml_models["model"].named_steps['classifier']
+            
+            transformed_data = preprocessor.transform(input_data)
+            target_class_idx = int(model.predict(transformed_data)[0])
+            probabilities = model.predict_proba(transformed_data)[0]
+            confidence_float = float(probabilities[target_class_idx])
+            
+            prediction_string = str(ml_models["label_encoder"].inverse_transform([target_class_idx])[0])
 
-        if prediction_string == "BENIGN":
-            return {
-                "threat_classification": prediction_string,
-                "confidence_score": confidence_float,
-                "top_3_features": [] 
-            }
+            if prediction_string == "BENIGN":
+            # Explicitly return the Pydantic object, not a raw dictionary
+                return PredictionResponse(
+                threat_classification=prediction_string,
+                confidence_score=confidence_float,
+                top_3_features=[] 
+            )
             
-        else:
-            logger.info(f"Threat detected! Classification: {prediction_string} | Confidence: {confidence_float:.2f}")
+            else:
+                logger.info(f"Threat detected! Classification: {prediction_string} | Confidence: {confidence_float:.2f}")
             
-            shap_explanation = ml_models["explainer"](transformed_data)[0, :, target_class_idx]
-            shap_explanation.feature_names = input_data.columns.tolist()
+                # Calculate the raw SHAP values
+                shap_explanation = ml_models["explainer"](transformed_data)[0, :, target_class_idx]
+            
+            # --- DEFENSIVE PROGRAMMING FIX ---
+            # Extract the CORRECT post-transformation feature names from the preprocessor
+            try:
+                # This gets the exact names created by OneHotEncoders, Scalers, etc.
+                correct_feature_names = preprocessor.get_feature_names_out()
+            except AttributeError:
+                # Fallback safeguard in case a custom transformer lacks this method
+                logger.warning("Preprocessor missing get_feature_names_out(). Using generic indices.")
+                correct_feature_names = [f"transformed_feat_{i}" for i in range(transformed_data.shape[1])]
+            
+            # Assign the correct names to the SHAP explanation
+            shap_explanation.feature_names = list(correct_feature_names)
+            # ---------------------------------
+
             top_3_reasons = get_top_3_shap_features(shap_explanation)
             
-            return {
-                "threat_classification": prediction_string,
-                "confidence_score": confidence_float,
-                "top_3_features": top_3_reasons
-            }
+            return PredictionResponse(
+                threat_classification=prediction_string,
+                confidence_score=confidence_float,
+                top_3_features=top_3_reasons
+            )
+        # DELEGATE: Send the heavy math to the background thread pool
+        # It will return the fully-formed PredictionResponse object!
+        final_response = await run_in_threadpool(compute_ml_inference)
+        
+        # RETURN RESULT directly to the user
+        return final_response
         
     except ValueError as ve:
-        # Catch feature name mismatches or preprocessing failures explicitly
         logger.error(f"Data Validation Error: {str(ve)}")
         raise HTTPException(status_code=422, detail=f"Data Validation Error: {str(ve)}")
         
