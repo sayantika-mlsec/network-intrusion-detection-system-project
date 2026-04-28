@@ -1,7 +1,3 @@
-Here is the complete, production-ready `CONTRIBUTING.md` file in raw Markdown. 
-
-Click the **Copy** button in the top right corner of the block below, paste it exactly as-is into your file, save it, and commit it to your `docs/contributing-file` branch.
-
 ```markdown
 # Contributing to the NIDS API
 
