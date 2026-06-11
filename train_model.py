@@ -1,7 +1,30 @@
 # %%
 import duckdb
 import pandas as pd
+import numpy as np
+import joblib
+import optuna
+from sklearn.preprocessing import FunctionTransformer, RobustScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from xgboost import XGBClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.metrics import fbeta_score, make_scorer
+from sklearn.metrics import classification_report
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
 
+# --- ENVIRONMENT CONFIGURATION ---
+# Set to True for a quick syntax/logic check.
+# Set to False for the full production tuning run.
+DEV_MODE = True
+N_TRIALS = 2 if DEV_MODE else 20
+# ---------------------------------
+
+# %%
 # Define the production-grade query
 query = """
 WITH BenignSample AS (
@@ -24,7 +47,10 @@ WHERE rn <= 200;
 """
 
 # Execute directly into a Pandas DataFrame
-df_sample = duckdb.query(query).df()
+con = duckdb.connect()
+con.execute("SET threads TO 1;")
+con.execute("SELECT setseed(0.42);")
+df_sample = con.execute(query).df()
 # Checking how many rows exist for each attack type
 class_counts = df_sample['Label'].value_counts()
 print("Original Class Counts:\n", class_counts)
@@ -38,16 +64,10 @@ df_sample = df_sample[df_sample['Label'].isin(valid_classes)]
 print("\nPruned Class Counts:\n", df_sample['Label'].value_counts())
 
 # %%
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import FunctionTransformer, RobustScaler
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
-import sklearn
 
-# Force Scikit-Learn to output Pandas DataFrames instead of raw NumPy arrays
-sklearn.set_config(transform_output="pandas")
+print(df_sample.select_dtypes('number').sum().sum())
+
+# %%
 
 def replace_inf_with_nan(X):
     # Safer implementation ensuring it operates on a copy
@@ -92,16 +112,11 @@ preprocessor = ColumnTransformer(
 )
 
 # %%
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
-
 # 1. Define X_raw(defined in the previous cell) and y_raw FIRST
 y_raw = df_sample["Label"]
 
 # 2. Split the RAW data (No leakage!)
-X_train, X_cv, y_train_raw, y_cv_raw = train_test_split(X_raw, y_raw, test_size=0.2, random_state=42)
+X_train, X_cv, y_train_raw, y_cv_raw = train_test_split(X_raw, y_raw, test_size=0.2, random_state=42, stratify=y_raw)
 
 # 3. Encode the target labels (XGBoost needs integers)
 label_encoder = LabelEncoder()
@@ -109,7 +124,6 @@ y_train = label_encoder.fit_transform(y_train_raw)
 y_cv = label_encoder.transform(y_cv_raw)
 
 # %%
-import pandas as pd
 
 print("class NetworkPacket(BaseModel):")
 print('    """')
@@ -138,9 +152,6 @@ print("\n    class Config:")
 print("        populate_by_name = True")
 
 # %%
-import numpy as np
-from sklearn.metrics import fbeta_score, make_scorer
-
 # 1. PREP: Fix the multi-class scorer
 #Set average='macro' to explicitly tell the model to treat every anomaly class equally
 f2_scorer = make_scorer(fbeta_score, beta=2, average='macro')
@@ -166,18 +177,6 @@ for cls in unique_classes:
 #The sampling strategy will be used later for SMOTE to generate 500 synthetic examples of the anomaly classes
 
 # %%
-import optuna
-from xgboost import XGBClassifier
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-
-# --- ENVIRONMENT CONFIGURATION ---
-# Set to True for a quick syntax/logic check.
-# Set to False for the full production tuning run.
-DEV_MODE = False
-N_TRIALS = 2 if DEV_MODE else 20
-# ---------------------------------
 
 # Defining the objective function for optuna
 def objective(trial, X, y):
@@ -206,7 +205,7 @@ def objective(trial, X, y):
     return scores.mean()
 
 # EXECUTE THE STUDY
-study = optuna.create_study(direction='maximize', study_name="CICIDS_XGBoost_Tuning")
+study = optuna.create_study(direction='maximize', study_name="CICIDS_XGBoost_Tuning", sampler=optuna.samplers.TPESampler(seed=42))
 
 print(f"Starting Optuna Hyperparameter Tuning... (DEV_MODE: {DEV_MODE})")
 # Wrap in a lambda so Optuna can inject the 'trial' object dynamically
@@ -216,58 +215,33 @@ print(f"Best F2-Score: {study.best_value:.4f}")
 print("Best Params:", study.best_params)
 
 # %%
-from sklearn.metrics import classification_report
 best_pipeline = ImbPipeline([('preprocessing', preprocessor),
                              ('smote', SMOTE(sampling_strategy=smote_strategy, random_state=42)),
-                             ('classifier', XGBClassifier(**study.best_params, random_state=42, eval_metric='mlogloss',objective="multi:softprob",n_jobs=-1))
+                             ('classifier', XGBClassifier(**study.best_params, random_state=42, eval_metric='mlogloss',objective="multi:softprob",n_jobs=-1, num_class=num_classes))
     ])
 best_pipeline.fit(X_train,y_train)
 predicted = best_pipeline.predict(X_cv)
+
+labels = sorted(set(y_cv))  # the integer-encoded classes present
+per_class_f2 = fbeta_score(y_cv, predicted, beta=2, average=None, labels=labels)
+class_names = label_encoder.inverse_transform(labels)
+
+for name, score in zip(class_names, per_class_f2):
+    print(f"{name}: {score:.4f}")
+
+
 print(classification_report(y_cv_raw,label_encoder.inverse_transform(predicted)))
 
-# %%
-import shap
-def plot_multi_class_waterfall(pipeline, preprocessor, explainer, label_encoder, X_sample, target_class_string, row_index=0):
-    """
-    Generates a SHAP waterfall plot for a specific network packet and target class.
-    """
-    transformed_data = preprocessor.transform(X_sample)
-    cls_idx = label_encoder.transform([target_class_string])[0]
-    shap_explanation = explainer(transformed_data)[row_index,:,cls_idx]
-    return shap.plots.waterfall(shap_explanation)
-
-# ... (rest of your script) ...
-
-if DEV_MODE:
-    print("Testing SHAP explanation generation...")
-    # Grab a single row from the cross-validation set as a DataFrame
-    test_packet = X_cv.iloc[[0]] 
-    
-    # Calling the new function
-    plot_multi_class_waterfall(
-        pipeline=best_pipeline,
-        preprocessor=preprocessor,
-        explainer= shap.TreeExplainer(best_pipeline.named_steps['classifier']),
-        label_encoder=label_encoder,
-        X_sample=test_packet,
-        target_class_string='Web Attack - XSS - Attempted',
-        row_index=0
-    )
-    print("SHAP test complete.")
-
-DEV_MODE=False
 
 # %%
-# Export 1 Benign row and 1 Attack row for robust testing
-X_cv.head(2).to_csv("X_test.csv", index=False)
+# Export first 5 rows for robust testing
+X_cv.head(5).to_csv("X_test.csv", index=False)
 
 # %%
-import joblib
 
 joblib.dump(best_pipeline, 'nids_pipeline.pkl')
 joblib.dump(label_encoder, 'nids_label_encoder.pkl')
 
 # Let's export just the pipeline and encoder for now.
 print("Artifacts successfully serialized to disk.")
-
 
