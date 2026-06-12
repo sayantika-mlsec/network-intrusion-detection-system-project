@@ -185,3 +185,5 @@ myenv/
 *.joblib
 *.csv
 message.txt
+mlflow.db
+mlartifacts/
