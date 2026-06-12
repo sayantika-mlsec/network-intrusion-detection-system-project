@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.metrics import fbeta_score, make_scorer
+from sklearn.metrics import fbeta_score, make_scorer, precision_recall_fscore_support
 from sklearn.metrics import classification_report
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.over_sampling import SMOTE
@@ -233,24 +233,57 @@ print(f"Best F2-Score: {study.best_value:.4f}")
 print("Best Params:", study.best_params)
 
 # %%
-best_pipeline = ImbPipeline([('preprocessing', preprocessor),
-                             ('smote', SMOTE(sampling_strategy=smote_strategy, random_state=42)),
-                             ('classifier', XGBClassifier(**study.best_params, random_state=42, eval_metric='mlogloss',objective="multi:softprob",n_jobs=-1, num_class=num_classes))
-    ])
-best_pipeline.fit(X_train,y_train)
-predicted = best_pipeline.predict(X_cv)
+# Start a top-level run for the final production model (nested=False is default)
+with mlflow.start_run(run_name="production_model"):
+    
+    # Set the tag
+    mlflow.set_tag("stage", "production")
+    
+    # Log configuration parameters
+    # Converting the dictionary to a string so MLflow can store it as a parameter
+    named_strategy = {
+    label_encoder.inverse_transform([k])[0]: int(v)
+    for k, v in smote_strategy.items()
+    }
 
-labels = sorted(set(y_cv))  # the integer-encoded classes present
-per_class_f2 = fbeta_score(y_cv, predicted, beta=2, average=None, labels=labels)
-class_names = label_encoder.inverse_transform(labels)
+    mlflow.log_param("smote_strategy", str(named_strategy))
+    mlflow.log_param("decision_rule", "argmax")
+    mlflow.log_params(study.best_params)
 
-for name, score in zip(class_names, per_class_f2):
-    print(f"{name}: {score:.4f}")
+    best_pipeline = ImbPipeline([('preprocessing', preprocessor),
+                                 ('smote', SMOTE(sampling_strategy=smote_strategy, random_state=42)),
+                                 ('classifier', XGBClassifier(**study.best_params, random_state=42, eval_metric='mlogloss',objective="multi:softprob",n_jobs=-1, num_class=num_classes))
+        ])
+    best_pipeline.fit(X_train,y_train)
+    predicted = best_pipeline.predict(X_cv)
 
+    labels = sorted(set(y_cv))  # the integer-encoded classes present
+    class_names = label_encoder.inverse_transform(labels)
 
-print(classification_report(y_cv_raw,label_encoder.inverse_transform(predicted)))
+    precision, recall, _, _ = precision_recall_fscore_support(y_cv, predicted, labels=labels, zero_division=0)
+    per_class_f2 = fbeta_score(y_cv, predicted, beta=2, average=None, labels=labels)
 
+    print("\n--- Final Per-Class Metrics ---")
 
+    # Zip everything together so we iterate safely across names and all 3 scores simultaneously
+    for name, p, r, f2 in zip(class_names, precision, recall, per_class_f2):
+
+        # Keep your console print!
+        print(f"{name} -> Precision: {p:.4f} | Recall: {r:.4f} | F2: {f2:.4f}")
+
+        # Clean the name for MLflow keys
+        clean_name = str(name).replace(" ", "_").replace("-", "_").replace("/", "_").replace("\\", "_")
+
+        # Log to MLflow
+        mlflow.log_metric(f"class_{clean_name}_precision", p)
+        mlflow.log_metric(f"class_{clean_name}_recall", r)
+        mlflow.log_metric(f"class_{clean_name}_f2", f2)
+
+    # Log the fully fitted model artifact
+    mlflow.sklearn.log_model(best_pipeline, name="production_pipeline")
+
+    print("\nProduction model, parameters, and per-class metrics successfully logged to MLflow.")
+    
 # %%
 # Export first 5 rows for robust testing
 X_cv.head(5).to_csv("X_test.csv", index=False)
