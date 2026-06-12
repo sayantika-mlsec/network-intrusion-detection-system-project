@@ -25,6 +25,12 @@ N_TRIALS = 2 if DEV_MODE else 20
 # ---------------------------------
 
 # %%
+import mlflow
+
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("NIDS_XGBoost")
+
+# %%
 # Define the production-grade query
 query = """
 WITH BenignSample AS (
@@ -62,10 +68,6 @@ valid_classes = class_counts[class_counts >= 15].index
 df_sample = df_sample[df_sample['Label'].isin(valid_classes)]
 
 print("\nPruned Class Counts:\n", df_sample['Label'].value_counts())
-
-# %%
-
-print(df_sample.select_dtypes('number').sum().sum())
 
 # %%
 
@@ -180,36 +182,52 @@ for cls in unique_classes:
 
 # Defining the objective function for optuna
 def objective(trial, X, y):
-    
-    # Defining the parameters
-    param = {
-        'max_depth': trial.suggest_int('max_depth', 3, 10),
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-        'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'gamma': trial.suggest_float('gamma', 1.0, 5.0)
-    }
 
-    # Building the Pipeline
-    nids_pipeline = ImbPipeline([
-        ('preprocessing', preprocessor),
-        ('smote', SMOTE(sampling_strategy=smote_strategy, random_state=42)),
-        ('classifier', XGBClassifier(**param, random_state=42, eval_metric='mlogloss', objective='multi:softprob', num_class=num_classes, n_jobs=-1))
-    ])
+    # Start a nested MLflow run for each trial
+    with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}"):
 
-    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-    scores = cross_val_score(nids_pipeline, X, y, cv=cv, scoring=f2_scorer)
-    
-    return scores.mean()
+        # Defining the parameters
+        param = {
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'gamma': trial.suggest_float('gamma', 1.0, 5.0)
+        }
+
+        # Log parameters for this specific trial
+        mlflow.log_params(param)
+
+        # Building the Pipeline
+        nids_pipeline = ImbPipeline([
+            ('preprocessing', preprocessor),
+            ('smote', SMOTE(sampling_strategy=smote_strategy, random_state=42)),
+            ('classifier', XGBClassifier(**param, random_state=42, eval_metric='mlogloss', objective='multi:softprob', num_class=num_classes, n_jobs=-1))
+        ])
+
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        scores = cross_val_score(nids_pipeline, X, y, cv=cv, scoring=f2_scorer)
+        mean_score = scores.mean()
+        # Log the resulting cross-validation score for this trial
+        mlflow.log_metric("cv_f2_score", mean_score)
+
+        return mean_score
 
 # EXECUTE THE STUDY
 study = optuna.create_study(direction='maximize', study_name="CICIDS_XGBoost_Tuning", sampler=optuna.samplers.TPESampler(seed=42))
 
 print(f"Starting Optuna Hyperparameter Tuning... (DEV_MODE: {DEV_MODE})")
-# Wrap in a lambda so Optuna can inject the 'trial' object dynamically
-study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=N_TRIALS)
+
+# Open the parent MLflow run
+with mlflow.start_run(run_name="Optuna_Study_Parent"):
+    # Wrap in a lambda so Optuna can inject the 'trial' object dynamically
+    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=N_TRIALS)
+
+    # Log the best parameters and score from the entire study to the parent run
+    mlflow.log_params({f"best_{k}": v for k, v in study.best_params.items()})
+    mlflow.log_metric("best_cv_f2_score", study.best_value)
 
 print(f"Best F2-Score: {study.best_value:.4f}")
 print("Best Params:", study.best_params)
