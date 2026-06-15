@@ -183,7 +183,6 @@ data/
 myenv/
 *.pkl
 *.joblib
-*.csv
 message.txt
 mlflow.db
 mlartifacts/
