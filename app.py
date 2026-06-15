@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = os.getenv("MODEL_PATH", "nids_pipeline.pkl")
 ENCODER_PATH = os.getenv("ENCODER_PATH", "nids_label_encoder.pkl")
 
-
 # Global dictionary
 ml_models = {}
 
@@ -26,6 +25,7 @@ async def lifespan(app: FastAPI):
     logger.info("Booting up ML Engine...")
     try:
         pipeline = joblib.load(MODEL_PATH)
+        # Unpack directly from the serialized ImbPipeline
         ml_models["model"] = pipeline.named_steps['classifier']
         ml_models["preprocessor"] = pipeline.named_steps['preprocessing']
         ml_models["label_encoder"] = joblib.load(ENCODER_PATH)
@@ -35,7 +35,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.critical(f"FATAL: Failed to load ML artifacts: {e}", exc_info=True)
         raise RuntimeError(f"ML artifact loading failed: {e}") from e
-
         
     yield 
     
@@ -44,18 +43,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NIDS Threat Detection API", lifespan=lifespan)
 
-# --- SOC TRANSLATION DICTIONARY ---
+# --- SOC TRANSLATIONS ---
 SOC_TRANSLATIONS = {
-    "Protocol": "Abnormal protocol detected for this traffic profile.",
-    "Src_port": "Suspicious source port usage, potential reconnaissance.",
-    "Dst_port": "Anomalous destination port targeted.",
-    "Flow_Duration": "Unusually long connection time, indicating potential data exfiltration.",
-    # Note: Expand this based on top 10-15 highest-impact SHAP features
+    "ports__Src Port": "Suspicious well-known source port targeted (< 1024).",
+    "ports__Dst Port": "Suspicious well-known destination port targeted (< 1024).",
+    "num__Flow Duration": "Unusually long connection time, indicating potential data exfiltration or scanning.",
+    "num__Protocol": "Abnormal protocol detected for this traffic profile.",
 }
 
 # --- SCHEMA DEFINITIONS ---
 class NetworkPacket(BaseModel):
-    # Using aliases ensures pythonic variables while accepting Scikit-Learn's exact strings
     Src_IP_dec: int = Field(alias="Src IP dec")
     Src_Port: int = Field(alias="Src Port")
     Dst_IP_dec: int = Field(alias="Dst IP dec")
@@ -144,9 +141,8 @@ class NetworkPacket(BaseModel):
     Total_TCP_Flow_Time: int = Field(alias="Total TCP Flow Time")
     Attempted_Category: int = Field(alias="Attempted Category")
 
-    
     class Config:
-        populate_by_name = True # Allows to pass either the alias or the variable name
+        populate_by_name = True
 
 class ShapFeature(BaseModel):
     feature: str
@@ -159,24 +155,13 @@ class PredictionResponse(BaseModel):
     top_3_features: List[ShapFeature]  
 
 def get_top_3_shap_features(shap_explanation):
-    # Ensure it's a numpy array to easily check its shape
     shap_values = np.array(shap_explanation.values)
     
-    # --- DEFENSIVE PROGRAMMING GUARDRAIL ---
-    # SHAP values must be 1D (n_features,) for a single instance and single class.
-    # If it's 2D or more, np.argsort will sort row-by-row and return garbage indices.
     if shap_values.ndim != 1:
-        raise ValueError(
-            f"SHAP Explainer Error: Expected 1D array, got shape {shap_values.shape}. "
-            "You must slice the SHAP explanation for a specific instance and target class "
-            "before passing it to this function."
-        )
-    # ----------------------------------------
+        raise ValueError(f"SHAP Explainer Error: Expected 1D array, got shape {shap_values.shape}.")
 
     abs_shap_values = np.abs(shap_values)
-
     top_n = min(3, len(shap_values))
-    # Now it is perfectly safe to use np.argsort
     top_indices = np.argsort(abs_shap_values)[-top_n:][::-1]
 
     feature_names = shap_explanation.feature_names
@@ -188,10 +173,10 @@ def get_top_3_shap_features(shap_explanation):
         feat_name = str(feature_names[idx])
         score = float(shap_values[idx])
         
-        # Map to SOC plain English, with a fallback
+        # Note: Scikit-learn ColumnTransformer feature names will match 'num__ColName' or 'ports__ColName'
         english_translation = SOC_TRANSLATIONS.get(
             feat_name, 
-            f"Anomalous metric detected in {feat_name}."
+            f"Anomalous metric detected in feature: {feat_name}."
         )
 
         top_3_results.append({
@@ -207,20 +192,29 @@ def get_top_3_shap_features(shap_explanation):
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_threat(packet: NetworkPacket):  
 
-    if not ml_models.get('model'):
-        raise HTTPException(
-                status_code=503,
-                detail="Model not loaded. Service unavailable."
-    )
+    if not ml_models.get('model') or not ml_models.get('preprocessor'):
+        raise HTTPException(status_code=503, detail="Model not fully loaded.")
     
     try:
-        # FAST I/O: Pydantic validation and dict dumping happen on the main event loop
+        # 1. Gather payload via true field names matching scikit-learn training headers
         input_data = pd.DataFrame([packet.model_dump(by_alias=True)]) 
         
-        # ISOLATE THE HEAVY LIFTING: Wrap the Scikit-Learn & SHAP math in a normal function
+        # 2. --- NEW MANUAL PRODUCTION INFERENCE TRANSFORMATIONS ---
+        # Clean infinite float spaces
+        input_data = input_data.replace([np.inf, -np.inf], np.nan)
+        
+        # Binary engineer port constraints
+        port_cols = ['Src Port', 'Dst Port']
+        for col in port_cols:
+            if col in input_data.columns:
+                input_data[col] = (input_data[col] < 1024).astype(int)
+        # ---------------------------------------------------------
+        
+        # Heavy computation isolated to thread pool
         def compute_ml_inference():
-            preprocessor = ml_models["preprocessor"].named_steps['preprocessing']
-            model = ml_models["model"].named_steps['classifier']
+            # FIXED BUG: References updated to use globally cached steps cleanly
+            preprocessor = ml_models["preprocessor"]
+            model = ml_models["model"]
             
             transformed_data = preprocessor.transform(input_data)
             target_class_idx = int(model.predict(transformed_data)[0])
@@ -230,45 +224,32 @@ async def predict_threat(packet: NetworkPacket):
             prediction_string = str(ml_models["label_encoder"].inverse_transform([target_class_idx])[0])
 
             if prediction_string == "BENIGN":
-            # Explicitly return the Pydantic object, not a raw dictionary
                 return PredictionResponse(
-                threat_classification=prediction_string,
-                confidence_score=confidence_float,
-                top_3_features=[] 
-            )
-            
+                    threat_classification=prediction_string,
+                    confidence_score=confidence_float,
+                    top_3_features=[] 
+                )
             else:
                 logger.info(f"Threat detected! Classification: {prediction_string} | Confidence: {confidence_float:.2f}")
             
-                # Calculate the raw SHAP values
                 shap_explanation = ml_models["explainer"](transformed_data)[0, :, target_class_idx]
             
-            # --- DEFENSIVE PROGRAMMING FIX ---
-            # Extract the CORRECT post-transformation feature names from the preprocessor
-            try:
-                # This gets the exact names created by OneHotEncoders, Scalers, etc.
-                correct_feature_names = preprocessor.get_feature_names_out()
-            except AttributeError:
-                # Fallback safeguard in case a custom transformer lacks this method
-                logger.warning("Preprocessor missing get_feature_names_out(). Using generic indices.")
-                correct_feature_names = [f"transformed_feat_{i}" for i in range(transformed_data.shape[1])]
+                try:
+                    correct_feature_names = preprocessor.get_feature_names_out()
+                except AttributeError:
+                    logger.warning("Preprocessor missing get_feature_names_out(). Using generic indices.")
+                    correct_feature_names = [f"transformed_feat_{i}" for i in range(transformed_data.shape[1])]
             
-            # Assign the correct names to the SHAP explanation
-            shap_explanation.feature_names = list(correct_feature_names)
-            # ---------------------------------
+                shap_explanation.feature_names = list(correct_feature_names)
+                top_3_reasons = get_top_3_shap_features(shap_explanation)
+                
+                return PredictionResponse(
+                    threat_classification=prediction_string,
+                    confidence_score=confidence_float,
+                    top_3_features=top_3_reasons
+                )
 
-            top_3_reasons = get_top_3_shap_features(shap_explanation)
-            
-            return PredictionResponse(
-                threat_classification=prediction_string,
-                confidence_score=confidence_float,
-                top_3_features=top_3_reasons
-            )
-        # DELEGATE: Send the heavy math to the background thread pool
-        # It will return the fully-formed PredictionResponse object!
         final_response = await run_in_threadpool(compute_ml_inference)
-        
-        # RETURN RESULT directly to the user
         return final_response
         
     except ValueError as ve:

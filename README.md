@@ -25,5 +25,55 @@ While CICIDS 2017 is a standard benchmark, deploying a model trained exclusively
 
 * **Concept Drift & Age:** The dataset captures 2017 traffic patterns. It lacks visibility into modern zero-day vulnerabilities, recent ransomware behaviors, and the massive architectural shift to remote-work VPNs and encrypted TLS 1.3 traffic that defines networks today.
 * **Simulation Artifacts & Overfitting:** Because the data was generated in a controlled lab, ML algorithms are highly prone to overfitting on meaningless simulation artifacts (such as specific hardcoded MAC addresses, predictable TTL values, or localized TCP window sizes) rather than learning the actual underlying malicious behavior.
+<<<<<<< HEAD
+* **Labeling Inconsistencies:** Independent academic reviews have highlighted flaws in the dataset's original flow construction, such as TCP timeout misconfigurations that occasionally cause subsequent malicious flows to adopt the wrong direction and be mislabeled as benign traffic. In production, this model would require continuous monitoring and retraining on live, localized SOC data.
+=======
 * **Labeling Inconsistencies:** Independent academic reviews have highlighted flaws in the dataset's original flow construction, such as TCP timeout misconfigurations that occasionally cause subsequent malicious flows to adopt the wrong direction and be mislabeled as benign traffic. In production, this model would require continuous monitoring and retraining on live, localized SOC data.
 
+## 5. Prerequisites
+To build and run this service locally, you strictly need:
+* **Git:** Required to clone the repository.
+* **Docker (v20.10.0+):** Required to build and spin up the API container.
+
+## 6. Quickstart: Build & Run
+
+* **1. Clone the repository:**
+
+```bash
+git clone https://github.com/sayantika-mlsec/network-intrusion-detection-system-project.git
+cd network-intrusion-detection-system-project
+```
+
+
+* **2. Build the Docker image:**
+
+```bash
+docker build -t nids-api:latest .
+```
+
+* **3. Run the container:**
+
+```bash
+docker run -d -p 8000:8000 --name nids-service nids-api:latest
+```
+The API is now live and listening on http://localhost:8000.
+
+## 7. Interacting with the API
+The Interactive Dashboard (Swagger UI)
+The easiest way to visually test the API is via the auto-generated Swagger UI.
+Open your browser and navigate to: http://localhost:8000/docs
+
+## 8. Programmatic Testing
+You can send POST requests directly to the /predict endpoint. A sample Python test script (docker_tests/test_dockerized_endpoint.py) is included in the repository to fire real test data (X_test.csv) at the container.
+
+Important: To run the test script locally, you must have Python installed along with the requests and pandas libraries.
+
+```bash
+# 1. Install the required local testing libraries
+pip install requests pandas
+
+# 2. Run the test script against the live container
+python docker_tests/test_dockerized_endpoint.py
+```  
+
+>>>>>>> 3d80a753a3715cab79543836dda833814032bbaa

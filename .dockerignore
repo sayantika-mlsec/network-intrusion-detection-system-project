@@ -1,0 +1,27 @@
+# Virtual environments
+myenv/
+
+# Secrets
+.env
+
+# Git and cache
+.git/
+__pycache__/
+*.pyc
+
+# Block all training data and generic models
+data/
+mlflow.db
+mlartifacts/
+scratch.ipynb
+train_model.py
+test_api.py
+verify_prod_model.py
+*.pkl
+*.csv
+requirements.txt
+message.txt
+
+# EXCEPT the exact default model the API needs to run
+!nids_pipeline.pkl
+!nids_label_encoder.pkl
