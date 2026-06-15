@@ -75,5 +75,3 @@ pip install requests pandas
 # 2. Run the test script against the live container
 python docker_tests/test_dockerized_endpoint.py
 ```  
-
->>>>>>> 3d80a753a3715cab79543836dda833814032bbaa
