@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 import pandas as pd
 import numpy as np
 from typing import List
@@ -141,8 +141,7 @@ class NetworkPacket(BaseModel):
     Total_TCP_Flow_Time: int = Field(alias="Total TCP Flow Time")
     Attempted_Category: int = Field(alias="Attempted Category")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 class ShapFeature(BaseModel):
     feature: str
