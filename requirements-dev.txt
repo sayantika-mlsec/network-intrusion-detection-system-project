@@ -1,0 +1,17 @@
+duckdb==1.5.2
+fastapi==0.136.0
+uvicorn==0.46.0
+pydantic==2.13.3
+pydantic_core==2.46.3
+pandas==2.3.3
+numpy==2.4.4
+joblib==1.5.3
+shap==0.51.0
+xgboost==3.2.0
+scikit-learn==1.8.0
+imbalanced-learn==0.14.1
+pytest==9.0.3
+httpx==0.28.1
+optuna==4.8.0
+mlflow==3.13.0
+evidently==0.7.21

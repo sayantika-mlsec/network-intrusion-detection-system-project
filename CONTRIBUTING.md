@@ -1,60 +1,108 @@
-```markdown
-# Contributing to the NIDS API
+# Contributing
 
-First, thank you for taking the time to contribute! We rely on the community to help harden this Network Intrusion Detection System (NIDS) API. 
-
-Whether it is a bug fix, a new SHAP visualization, or a performance upgrade, please follow the guidelines below to ensure a smooth, asynchronous collaboration process.
+This is a solo-built project, maintained as if it were a team repo — issues, branches, and PRs are used for every change. This document exists so anyone reviewing the code (or future-me) understands how the project is structured and how work gets done here.
 
 ---
 
 ## 1. Local Setup & Installation
 
-To run the NIDS API locally, follow these steps:
-
 **1. Clone the repository**
 ```bash
-git clone [https://github.com/sayantika-mlsec/network-intrusion-detection-system-project.git](https://github.com/sayantika-mlsec/network-intrusion-detection-system-project.git)
+git clone https://github.com/sayantika-mlsec/network-intrusion-detection-system-project.git
 cd network-intrusion-detection-system-project
 ```
 
 **2. Isolate your environment**
-We strongly recommend using a virtual environment to avoid dependency conflicts.
+
 ```bash
 python -m venv venv
 ```
 
 **3. Activate the environment**
-* **Mac/Linux:** `source venv/bin/activate`
-* **Windows (Command Prompt):** `venv\Scripts\activate.bat`
-* **Windows (PowerShell):** `venv\Scripts\Activate.ps1`
+- Mac/Linux: `source venv/bin/activate`
+- Windows (Command Prompt): `venv\Scripts\activate.bat`
+- Windows (PowerShell): `venv\Scripts\Activate.ps1`
 
 **4. Install dependencies**
 ```bash
+pip install -r requirements-serve.txt
 pip install -r requirements.txt
 ```
+`requirements-serve.txt` covers what's needed to run the API (used by Docker too). `requirements.txt` adds testing tools (`pytest`, `httpx`) and is the exact set CI installs — kept separate so CI doesn't carry serving-only concerns it doesn't need, and vice versa.
 
-**5. Generate ML Artifacts**
-To keep this repository lightweight, compiled model binaries are ignored via `.gitignore`. You must train the model locally to generate the artifacts.
+If you're retraining the model rather than using the committed artifacts, use `requirements-dev.txt` instead — it adds `duckdb`, `optuna`, `mlflow`, and `evidently` on top:
+```bash
+pip install -r requirements-dev.txt
+```
+
+**5. ML artifacts**
+
+`nids_pipeline.pkl` and `nids_label_encoder.pkl` are committed to the repo (not gitignored) — they're needed by CI for the integration test suite to load a real model on every push, rather than retraining from scratch each run. If you want to retrain locally instead of using the committed artifacts:
 ```bash
 python train_model.py
 ```
-*(Verify that `nids_pipeline.pkl` and `nids_label_encoder.pkl` are generated in your root directory before proceeding).*
 
 **6. Run the local development server**
 ```bash
-uvicorn main:app --reload
+uvicorn app:app --reload
 ```
-The API will be accessible at `http://127.0.0.1:8000`. 
-View the interactive API documentation at `http://127.0.0.1:8000/docs`.
+The API is accessible at `http://127.0.0.1:8000`. Interactive docs at `http://127.0.0.1:8000/docs`.
 
 ---
 
-## 2. Reporting Issues
+## 2. Testing
 
-If you find a bug or have a feature request, please open an issue. To help us resolve it quickly, please copy and paste the following template into your issue description and fill it out:
+The test suite is split into two layers, deliberately:
 
-**Issue Template:**
-```text
+**Unit tests** (`tests/test_api.py`) — fast, in-memory, no server required:
+```bash
+pytest tests/test_api.py -v
+```
+These use FastAPI's `TestClient` and `unittest.mock`, validating Pydantic schemas against a real row from `X_test.csv` while mocking the heavy ML artifacts via `@patch.dict('main.ml_models')`. They're fast but never exercise real deserialization.
+
+**Integration tests** (`tests/test_integration.py`) — real lifespan startup, real model load:
+```bash
+pytest tests/test_integration.py -v
+```
+These trigger the actual FastAPI lifespan and verify the full train -> serialize -> load -> predict round-trip. This is intentional: unit tests with mocked artifacts can't catch deserialization bugs that only surface when the real pickled pipeline gets loaded in a fresh environment. That gap was a real bug once — not theoretical.
+
+Both suites run automatically on every push via GitHub Actions (`.github/workflows/ci.yml`).
+
+If you add new endpoints or features, add isolated unit tests following the existing mocking pattern, and extend the integration suite if the change touches model loading or serialization.
+
+---
+
+## 3. Workflow
+
+1. **Issue first.** Every change starts as a GitHub issue with checkbox acceptance criteria, before any code is written.
+2. **Branch per feature**, with a descriptive prefix:
+   - `feature/your-feature-name`
+   - `bugfix/issue-description`
+   - `docs/readme-updates`
+3. **Commit with issue references.** `Refs #N` while in progress, `Closes #N` on the commit that resolves it.
+4. **PR with What / Why / Verification:**
+   - **What** changed
+   - **Why** (the engineering reasoning, not just the diff — e.g. "switched to Isolation Forest to reduce false positives")
+   - **Verification** — which tests were run, and why that's sufficient
+5. **Self-review before merge.** Even solo, the PR step forces a re-read of the diff before it lands on `main`.
+
+If your change alters API behavior — a new field on the `NetworkPacket` Pydantic model, a changed response shape — update `README.md` in the same PR.
+
+**Exception:** trivial doc-only fixes (typos, broken links, factual corrections that don't change behavior — e.g. fixing a README description to match the actual pipeline) can go straight to `main` without the full issue -> branch -> PR cycle. Anything that changes behavior, adds a feature, or touches code still follows the full workflow above.
+
+---
+
+## 4. Architecture decisions
+
+Non-trivial design choices are recorded as ADRs in [`docs/adr/`](./docs/adr/), numbered in chronological order — for example, the decision to containerize the serving API with Docker. Check there before assuming something was an oversight. More will be added as future decisions (model choice, imbalance handling, etc.) warrant one.
+
+---
+
+## 5. Reporting Issues
+
+Open an issue using this template:
+
+```
 **Describe the Bug or Feature:**
 [A clear and concise description]
 
@@ -72,36 +120,11 @@ If you find a bug or have a feature request, please open an issue. To help us re
 [What you expected vs what actually happened]
 
 **Error Logs:**
-[Paste logs here. WARNING: Scrub all sensitive network data, proprietary hashes, or internal IP addresses before posting!]
+[Paste logs here. Scrub any sensitive network data, hashes, or internal IP addresses before posting.]
 ```
 
----
+## 6. Known limitations
 
-## 3. Pull Request (PR) Process
+Honest, current limitations are tracked as open GitHub issues rather than buried in code comments. Check the [Issues tab](../../issues) before assuming something is unhandled — it may already be a known, scoped gap with reasoning attached.
 
-We welcome contributions of all sizes. To get your code merged, follow this workflow:
-
-**1. Fork and Branch**
-Always fork the repository and create a new branch for your work. Use a descriptive prefix:
-* `feature/your-feature-name`
-* `bugfix/issue-description`
-* `docs/readme-updates`
-
-**2. Pass the Fire Drills (Testing)**
-We use FastAPI's `TestClient` and Python's `unittest.mock` to perform rapid, in-memory testing. You do not need to have the Uvicorn server running to execute the test suite. 
-
-Ensure you have not broken the existing ML infrastructure or schema validation by running our test script:
-```bash
-pytest test_api.py -v
-```
-*Note for Contributors:* Our tests use a real dataset row (`X_test.csv`) to validate Pydantic schemas, while utilizing `@patch.dict('main.ml_models')` to mock the heavy ML artifacts. If you add new endpoints or ML features, please include relevant isolated tests following this architecture.
-
-**3. Update the Documentation**
-If your PR changes the API's behavior—such as adding a new feature to the Pydantic `NetworkPacket` model or altering the JSON response—you must update the `README.md`.
-
-**4. Write a Clear PR Description**
-When opening your PR, provide context:
-* Link to the issue your PR solves using GitHub automation keywords (e.g., `Closes #12`).
-* Briefly explain your technical approach (e.g., "Switched to Isolation Forest to reduce false positives").
-* Include a screenshot if your PR alters any visual outputs.
-```
+If you spot something not already listed — a bug, an edge case, a design tradeoff worth questioning — opening an issue is genuinely useful, even on a solo-maintained project. A second set of eyes catching something is exactly how this list grows.
